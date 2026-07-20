@@ -1,42 +1,54 @@
 import json
 import logging
 from pathlib import Path
-
+import torch
+import cv2
 from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
+
+STATIC_CLASSES = {'platform', 'peg'}
 
 
 class Detector:
     """
     Detector
 
-    Ejecuta inferencia cruda (sin tracking) de un modelo YOLO de segmentación
-    sobre un video completo, frame a frame, y devuelve/guarda las detecciones
-    (clase, confianza, bbox, polígono de máscara) en una estructura serializable
-    a JSON.
+    Ejecuta inferencia cruda (sin tracking ni filtrado por clase) de un modelo
+    YOLO de segmentación sobre un video completo y serializa las detecciones a JSON.
+
+    Las clases estáticas (peg, platform) solo se registran durante los primeros
+    `stabilize_max_frames` frames; el Stabilizer las procesará después con K-means.
+    Las clases dinámicas (ring, TFM) se registran en todos los frames sin filtrar.
 
     Parametros:
-        model_path (str | Path): ruta al archivo de pesos del modelo (ej. 'projects/model/pruebam1280.pt').
-        imgsz (int): resolución de inferencia, debe coincidir con la usada en entrenamiento (default 1280).
+        model_path (str | Path): ruta al archivo de pesos del modelo.
+        imgsz (int): resolución de inferencia (debe coincidir con entrenamiento).
 
     Ejemplo:
         detector = Detector(model_path='projects/model/pruebam1280.pt', imgsz=1280)
-        data = detector.run(video_path='ruta/al/video.mp4')
-        detector.save(data, output_path='projects/outputs/raw/video1_raw.json')
+        data = detector.run(video_path='video.mp4', confianza=0.4)
+        detector.save(data, output_path='projects/outputs/raw/video_raw.json')
     """
 
     def __init__(self, model_path, imgsz=1280):
         self.model = YOLO(model_path)
         self.imgsz = imgsz
 
-    def run(self, video_path):
+    def run(self, video_path, show=False, stabilize_max_frames=30, confianza=0.4, supresion=0.5):
         video_path = Path(video_path)
-        frames = []
+        dispositivo = 0 if torch.cuda.is_available() else 'cpu'
 
+        frames = []
         results_generator = self.model.predict(
-            source=str(video_path), stream=True, imgsz=self.imgsz
+            source=str(video_path), verbose=False, stream=True,
+            imgsz=self.imgsz, conf=confianza, iou=supresion,
+            device=dispositivo, end2end=False,
         )
+
+        if show:
+            cv2.namedWindow('debug', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('debug', 800, 450)
 
         for frame_idx, result in enumerate(results_generator):
             detections = []
@@ -45,23 +57,37 @@ class Detector:
 
             if boxes is not None:
                 for i in range(len(boxes)):
-                    class_id = int(boxes.cls[i])
-                    detection = {
-                        'class_id': class_id,
-                        'class_name': self.model.names[class_id],
-                        'confidence': float(boxes.conf[i]),
-                        'bbox': boxes.xyxy[i].tolist(),
+                    class_id   = int(boxes.cls[i])
+                    class_name = self.model.names[class_id]
+
+                    if class_name in STATIC_CLASSES and frame_idx >= stabilize_max_frames:
+                        continue
+
+                    detections.append({
+                        'class_id'    : class_id,
+                        'class_name'  : class_name,
+                        'confidence'  : float(boxes.conf[i]),
+                        'bbox'        : boxes.xyxy[i].tolist(),
                         'mask_polygon': masks.xy[i].tolist() if masks is not None else [],
-                    }
-                    detections.append(detection)
+                    })
+
+            if show:
+                cv2.imshow('debug', result.plot())
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
             frames.append({'frame_idx': frame_idx, 'detections': detections})
-            logger.debug(f'Frame {frame_idx}: {len(detections)} detecciones')
+            logger.debug('Frame %d: %d detecciones', frame_idx, len(detections))
+
+        if show:
+            cv2.destroyAllWindows()
 
         return {
-            'video': video_path.name,
-            'imgsz': self.imgsz,
-            'frames': frames,
+            'video'                : video_path.name,
+            'imgsz'               : self.imgsz,
+            'conf'                : confianza,
+            'stabilize_max_frames': stabilize_max_frames,
+            'frames'              : frames,
         }
 
     def save(self, data, output_path):
@@ -69,4 +95,20 @@ class Detector:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w') as f:
             json.dump(data, f)
-        logger.info(f'Inferencia cruda guardada en: {output_path}')
+        logger.info('Inferencia cruda guardada en: %s', output_path)
+
+
+def main():
+    ROOT        = Path(__file__).resolve().parent.parent
+    MODEL_PATH  = ROOT / 'model' / 'pruebam1280.pt'
+    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\UAO-Inhealth\Script\videos_pruebas\20220102_124648.MP4")
+    OUTPUT_PATH = ROOT / 'outputs' / 'raw'
+    OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+
+    detector = Detector(model_path=MODEL_PATH, imgsz=1280)
+    data = detector.run(video_path=VIDEO_PATH, show=True, confianza=0.4)
+    detector.save(data, output_path=OUTPUT_PATH / f'{VIDEO_PATH.stem}_raw.json')
+
+
+if __name__ == '__main__':
+    main()
