@@ -33,9 +33,10 @@ class Detector:
 
     def __init__(self, model_path, imgsz=1280):
         self.model = YOLO(model_path)
+        self.model.model.end2end = False
         self.imgsz = imgsz
 
-    def run(self, video_path, show=False, stabilize_max_frames=30, confianza=0.4, supresion=0.5):
+    def run(self, video_path, show=False, stabilize_max_frames=30, confianza=0.4, supresion=0.45):
         video_path = Path(video_path)
         dispositivo = 0 if torch.cuda.is_available() else 'cpu'
 
@@ -43,7 +44,7 @@ class Detector:
         results_generator = self.model.predict(
             source=str(video_path), verbose=False, stream=True,
             imgsz=self.imgsz, conf=confianza, iou=supresion,
-            device=dispositivo, end2end=False,
+            device=dispositivo,
         )
 
         if show:
@@ -94,19 +95,19 @@ class Detector:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w') as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=2)
         logger.info('Inferencia cruda guardada en: %s', output_path)
 
 
 def main():
     ROOT        = Path(__file__).resolve().parent.parent
-    MODEL_PATH  = ROOT / 'model' / 'pruebam1280.pt'
-    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\UAO-Inhealth\Script\videos_pruebas\20220102_124648.MP4")
+    MODEL_PATH  = ROOT / 'model' / 'exp.pt'
+    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\UAO-Inhealth\Script\videos_pruebas\Video corto.mp4")
     OUTPUT_PATH = ROOT / 'outputs' / 'raw'
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
     detector = Detector(model_path=MODEL_PATH, imgsz=1280)
-    data = detector.run(video_path=VIDEO_PATH, show=True, confianza=0.4)
+    data = detector.run(video_path=VIDEO_PATH, show=True, confianza=0.55)
     detector.save(data, output_path=OUTPUT_PATH / f'{VIDEO_PATH.stem}_raw.json')
 
 

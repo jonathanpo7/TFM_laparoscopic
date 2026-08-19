@@ -1,3 +1,4 @@
+import sys
 import json
 import logging
 from pathlib import Path
@@ -5,12 +6,11 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-logger = logging.getLogger(__name__)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-CLASS_CONF = {'ring': 0.40, 'TFM': 0.65, 'peg': 0.50, 'platform': 0.50}
-CLASS_MAX  = {'ring': 6,    'TFM': 2,    'peg': 12,   'platform': 1}
-N_PEGS        = 12
-OUTLIER_SIGMA = 2.0
+import config
+
+logger = logging.getLogger(__name__)
 
 
 class Stabilizer:
@@ -36,12 +36,12 @@ class Stabilizer:
         stabilizer.save(data, 'projects/outputs/stable/video_stable.json')
     """
 
-    def __init__(self, n_pegs=N_PEGS, stabilize_frames=30,
-                 class_conf=None, class_max=None, outlier_sigma=OUTLIER_SIGMA):
+    def __init__(self, n_pegs=config.N_PEGS, stabilize_frames=config.STABILIZE_MAX_FRAMES,
+                 class_conf=None, class_max=None, outlier_sigma=config.OUTLIER_SIGMA):
         self.n_pegs           = n_pegs
         self.stabilize_frames = stabilize_frames
-        self.class_conf       = class_conf or CLASS_CONF
-        self.class_max        = class_max  or CLASS_MAX
+        self.class_conf       = class_conf or config.CLASS_CONF
+        self.class_max        = class_max  or config.CLASS_MAX
         self.outlier_sigma    = outlier_sigma
 
     def process(self, raw_path):
@@ -164,5 +164,25 @@ class Stabilizer:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w') as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=2)
         logger.info('JSON estabilizado guardado en: %s', output_path)
+
+
+def main():
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler()],
+    )
+    ROOT        = Path(__file__).resolve().parent.parent
+    RAW_PATH    = ROOT / 'outputs' / 'raw'    / 'Video corto_raw.json'
+    STABLE_PATH = ROOT / 'outputs' / 'stable' / 'Video corto_stable.json'
+
+    stabilizer  = Stabilizer()
+    data        = stabilizer.process(RAW_PATH)
+    stabilizer.save(data, STABLE_PATH)
+
+
+if __name__ == '__main__':
+    main()

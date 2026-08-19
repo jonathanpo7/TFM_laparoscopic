@@ -23,7 +23,7 @@ def main():
     raw_data = detector.run(video_path=VIDEO_PATH, confianza=0.4)
     detector.save(raw_data, output_path=RAW_PATH)
 
-    # Etapa A — estabilización de objetos estáticos + filtrado por clase
+    # Etapa B — estabilización de objetos estáticos + filtrado por clase
     stabilizer  = Stabilizer()
     stable_data = stabilizer.process(RAW_PATH)
     stabilizer.save(stable_data, output_path=STABLE_PATH)
