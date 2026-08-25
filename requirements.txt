@@ -1,0 +1,5 @@
+ultralytics
+boxmot
+opencv-python
+numpy
+scikit-learn
