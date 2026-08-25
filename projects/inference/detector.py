@@ -83,8 +83,13 @@ class Detector:
         if show:
             cv2.destroyAllWindows()
 
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+
         return {
             'video'                : video_path.name,
+            'fps'                  : fps,
             'imgsz'               : self.imgsz,
             'conf'                : confianza,
             'stabilize_max_frames': stabilize_max_frames,
@@ -101,8 +106,8 @@ class Detector:
 
 def main():
     ROOT        = Path(__file__).resolve().parent.parent
-    MODEL_PATH  = ROOT / 'model' / 'exp.pt'
-    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\UAO-Inhealth\Script\videos_pruebas\Video corto.mp4")
+    MODEL_PATH  = ROOT / 'model' / 'xl1280-1.pt'
+    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\Maestria en IA\Trabajo Fin de Master (TFM)\Datasets\Pruebas_personas\P01_FLS Task A_01\20230911125148 Trial1-2.mp4")
     OUTPUT_PATH = ROOT / 'outputs' / 'raw'
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 

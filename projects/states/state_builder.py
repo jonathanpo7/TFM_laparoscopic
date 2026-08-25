@@ -8,7 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logger = logging.getLogger(__name__)
 
-RING_PEG_THRESH = 120   # px — ring "sobre peg" si dist < este valor
+RING_PEG_THRESH = 80    # px — ring "sobre peg" si dist < este valor
+RATIO_THRESH    = 0.65  # ratio dist_nearest/dist_second — ring entre pegs si ratio ≥ este valor
 RING_TIP_THRESH = 50    # px — ring "con pinza" si dist < este valor
 PICKUP_THRESH   = 150   # px — punta de pinza cerca del peg del ring → pickup inferido
 INIT_FRAMES     = 30    # frames para inicializar rings físicos
@@ -35,9 +36,12 @@ class StateBuilder:
       3. Si hay 2+ rings en tránsito simultáneamente → ambigüedad, no asignar.
     """
 
-    def build(self, tracked_path):
-        with open(Path(tracked_path)) as f:
-            data = json.load(f)
+    def build(self, tracked_path_or_data):
+        if isinstance(tracked_path_or_data, dict):
+            data = tracked_path_or_data
+        else:
+            with open(Path(tracked_path_or_data)) as f:
+                data = json.load(f)
 
         pegs   = {p['peg_id']: p['centroid'] for p in data['static_objects']['pegs']}
         frames = data['frames']
@@ -65,8 +69,9 @@ class StateBuilder:
             for rid, r in physical_rings.items()
         }
 
-        windows   = []
-        n_windows = (len(frames) + WINDOW_SIZE - 1) // WINDOW_SIZE
+        windows         = []
+        n_windows       = (len(frames) + WINDOW_SIZE - 1) // WINDOW_SIZE
+        confirmed_dests = set()   # pegs destino ya confirmados — no se reasignan
 
         for wi in range(n_windows):
             f0       = wi * WINDOW_SIZE
@@ -82,24 +87,38 @@ class StateBuilder:
                 ctx[rid]['prev_detected'] = f['detected']
 
                 pid = f['near_peg_id']
-                if pid in dest_pegs and not f['graspers_near']:
+                if ctx[rid]['arrived_peg'] is not None:
+                    # Ring ya confirmó — solo carry-forward, no toca confirmed_dests
+                    f['arrived_peg'] = ctx[rid]['arrived_peg']
+                    ctx[rid]['arrival_buf'] = {}
+                elif pid in dest_pegs and pid not in confirmed_dests:
                     buf      = ctx[rid]['arrival_buf']
                     buf[pid] = buf.get(pid, 0) + 1
                     if buf[pid] >= ARRIVAL_WINDOWS:
                         f['arrived_peg'] = pid
-                        if ctx[rid]['arrived_peg'] is None:
-                            ctx[rid]['arrived_peg'] = pid
-                            logger.info('Ring %d llegó a peg destino %s (ventana %d, frame ~%d)',
-                                        rid, pid, wi, f0)
+                        confirmed_dests.add(pid)
+                        ctx[rid]['arrived_peg'] = pid
+                        logger.info('Ring %d llegó a peg destino %s (ventana %d, frame ~%d)',
+                                    rid, pid, wi, f0)
                 else:
                     ctx[rid]['arrival_buf'] = {}
-                    if ctx[rid]['arrived_peg']:
-                        f['arrived_peg'] = ctx[rid]['arrived_peg']
 
             windows.append({
                 'window': [f0, f1 - 1],
                 'facts':  {str(k): v for k, v in facts.items()},
             })
+
+        raw_platform = data['static_objects'].get('platform')
+        if raw_platform is None:
+            logger.warning('No se encontró plataforma en static_objects — métrica de caídas no disponible')
+            platform = None
+        else:
+            # Solo bbox y centroide — mask_polygon no se usa en métricas
+            platform = {
+                'bbox':       raw_platform.get('bbox'),
+                'centroid':   raw_platform.get('centroid'),
+                'confidence': raw_platform.get('confidence'),
+            }
 
         return {
             'video':          data['video'],
@@ -109,6 +128,7 @@ class StateBuilder:
             'source_pegs':    sorted(source_pegs),
             'dest_pegs':      dest_pegs,
             'pegs':           {str(pid): centroid for pid, centroid in pegs.items()},
+            'platform':       platform,
             'windows':        windows,
         }
 
@@ -126,26 +146,29 @@ class StateBuilder:
     def _init_rings(self, init_frames, pegs):
         """Detecta rings físicos en los primeros INIT_FRAMES frames.
 
-        Cada track_id que aparece cerca de un peg (< RING_PEG_THRESH px)
-        en mayoría de frames vota por ese peg. Se elige el peg con más votos
-        por track_id, descartando pegs ya asignados a otro ring.
+        Cada track_id vota por el peg más cercano (solo distancia, sin ratio,
+        porque al inicio los rings pueden estar apilados y el ratio sería demasiado
+        estricto). Si el mejor peg ya está asignado a otro ring, se intenta el
+        siguiente mejor peg del mismo track_id (fallback ordenado por votos).
         """
         votes = defaultdict(lambda: defaultdict(int))
         for frame in init_frames:
             for det in frame['detections']:
                 if det['class_name'] != 'ring':
                     continue
-                cx, cy   = det['centroid']
-                pid, dst = self._nearest_peg(cx, cy, pegs)
+                cx, cy      = det['centroid']
+                pid, dst, _ = self._nearest_peg(cx, cy, pegs)
                 if dst < RING_PEG_THRESH:
                     votes[det['track_id']][pid] += 1
 
         physical, used_pegs = {}, set()
         for rid, (tid, peg_votes) in enumerate(sorted(votes.items())):
-            best_peg = max(peg_votes, key=peg_votes.get)
-            if best_peg not in used_pegs:
-                physical[rid] = {'home_peg': best_peg, 'init_track_id': tid}
-                used_pegs.add(best_peg)
+            # Intentar pegs en orden de votos (mejor → peor)
+            for best_peg in sorted(peg_votes, key=peg_votes.get, reverse=True):
+                if best_peg not in used_pegs:
+                    physical[rid] = {'home_peg': best_peg, 'init_track_id': tid}
+                    used_pegs.add(best_peg)
+                    break
         return physical
 
     def _process_window(self, w_frames, physical_rings, pegs, ctx):
@@ -190,9 +213,10 @@ class StateBuilder:
                         per_frame[rid].append(None)
                     continue
 
-                cx, cy   = det['centroid']
-                pid, dst = self._nearest_peg(cx, cy, pegs)
-                near_peg = pid if dst < RING_PEG_THRESH else None
+                cx, cy             = det['centroid']
+                pid, dst, second_d = self._nearest_peg(cx, cy, pegs)
+                ratio_ok           = dst / second_d < RATIO_THRESH if second_d > 0 else True
+                near_peg           = pid if dst < RING_PEG_THRESH and ratio_ok else None
                 graspers = self._graspers_near(cx, cy, tfm_dets)
 
                 # near_peg refleja posición real del ring.
@@ -214,9 +238,14 @@ class StateBuilder:
         """
         assign, used = {}, set()
 
-        # Paso 1: cada ring busca detección cerca de su peg esperado
+        # Paso 1: cada ring busca detección cerca de su peg esperado.
+        # Si ya confirmó llegada, se ancla al dest confirmado para evitar
+        # que un switch de track_id lo desvíe de vuelta a su home peg.
         for rid, ring in physical_rings.items():
-            expected = ctx[rid]['prev_peg'] or ring['home_peg']
+            if ctx[rid]['arrived_peg'] is not None:
+                expected = ctx[rid]['arrived_peg']
+            else:
+                expected = ctx[rid]['prev_peg'] or ring['home_peg']
             if expected is None:
                 continue
             peg_pos = pegs[expected]
@@ -264,16 +293,18 @@ class StateBuilder:
                 'detected':      False,
                 'near_peg_id':   ctx['prev_peg'],
                 'graspers_near': ctx['prev_graspers'],
+                'graspers_any':  [],
                 'centroid':      None,
             }
 
         # Moda del peg (incluye None si es el valor más frecuente)
         peg_mode = Counter(s['near_peg'] for s in detected).most_common(1)[0][0]
 
-        # Pinza presente si aparece en mayoría de frames detectados
+        # Conteo de apariciones por pinza en frames detectados
         g_counts      = Counter(g for s in detected for g in s['graspers'])
         threshold     = max(1, len(detected) // 2)
-        graspers_near = [g for g, c in g_counts.items() if c >= threshold]
+        graspers_near = [g for g, c in g_counts.items() if c >= threshold]  # mayoría
+        graspers_any  = list(g_counts.keys())                                # cualquier frame
 
         # Centroide promedio de los frames donde el ring fue detectado
         cs = [s['centroid'] for s in detected if s.get('centroid') is not None]
@@ -283,6 +314,7 @@ class StateBuilder:
             'detected':      rate >= 0.5,
             'near_peg_id':   peg_mode,
             'graspers_near': graspers_near,
+            'graspers_any':  graspers_any,
             'centroid':      avg_centroid,
         }
 
@@ -296,12 +328,13 @@ class StateBuilder:
         return near
 
     def _nearest_peg(self, cx, cy, pegs):
-        best_pid, best_d = None, float('inf')
-        for pid, (px, py) in pegs.items():
-            d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
-            if d < best_d:
-                best_d, best_pid = d, pid
-        return best_pid, best_d
+        distances = sorted(
+            (((cx - px) ** 2 + (cy - py) ** 2) ** 0.5, pid)
+            for pid, (px, py) in pegs.items()
+        )
+        best_d,   best_pid = distances[0] if distances else (float('inf'), None)
+        second_d            = distances[1][0] if len(distances) > 1 else float('inf')
+        return best_pid, best_d, second_d
 
     def _dist(self, a, b):
         return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
@@ -314,8 +347,8 @@ def main():
         handlers=[logging.StreamHandler()],
     )
     ROOT         = Path(__file__).resolve().parent.parent
-    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / 'Video corto_tracked.json'
-    STATES_PATH  = ROOT / 'outputs' / 'states'  / 'Video corto_states.json'
+    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / '20230911125148 Trial1-2_tracked.json'
+    STATES_PATH  = ROOT / 'outputs' / 'states'  / '20230911125148 Trial1-2_states.json'
 
     builder = StateBuilder()
     data    = builder.build(TRACKED_PATH)

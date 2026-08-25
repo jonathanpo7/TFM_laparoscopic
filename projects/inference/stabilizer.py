@@ -44,10 +44,12 @@ class Stabilizer:
         self.class_max        = class_max  or config.CLASS_MAX
         self.outlier_sigma    = outlier_sigma
 
-    def process(self, raw_path):
-        raw_path = Path(raw_path)
-        with open(raw_path) as f:
-            raw = json.load(f)
+    def process(self, raw_path_or_data):
+        if isinstance(raw_path_or_data, dict):
+            raw = raw_path_or_data
+        else:
+            with open(Path(raw_path_or_data)) as f:
+                raw = json.load(f)
 
         peg_accum      = []
         platform_accum = []
@@ -176,8 +178,8 @@ def main():
         handlers=[logging.StreamHandler()],
     )
     ROOT        = Path(__file__).resolve().parent.parent
-    RAW_PATH    = ROOT / 'outputs' / 'raw'    / 'Video corto_raw.json'
-    STABLE_PATH = ROOT / 'outputs' / 'stable' / 'Video corto_stable.json'
+    RAW_PATH    = ROOT / 'outputs' / 'raw'    / '20230911125148 Trial1-2_raw.json'
+    STABLE_PATH = ROOT / 'outputs' / 'stable' / '20230911125148 Trial1-2_stable.json'
 
     stabilizer  = Stabilizer()
     data        = stabilizer.process(RAW_PATH)

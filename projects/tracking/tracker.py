@@ -71,10 +71,12 @@ class Tracker:
     # publico
     # ------------------------------------------------------------------
 
-    def process(self, stable_path):
-        stable_path = Path(stable_path)
-        with open(stable_path) as f:
-            stable = json.load(f)
+    def process(self, stable_path_or_data):
+        if isinstance(stable_path_or_data, dict):
+            stable = stable_path_or_data
+        else:
+            with open(Path(stable_path_or_data)) as f:
+                stable = json.load(f)
 
         tracked_frames = []
         # track_to_grasper : {track_id -> (grasper_idx, extreme_idx)}
@@ -338,8 +340,8 @@ def main():
         handlers=[logging.StreamHandler()],
     )
     ROOT         = Path(__file__).resolve().parent.parent
-    STABLE_PATH  = ROOT / 'outputs' / 'stable'  / 'Video corto_stable.json'
-    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / 'Video corto_tracked.json'
+    STABLE_PATH  = ROOT / 'outputs' / 'stable'  / '20230911125148 Trial1-2_stable.json'
+    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / '20230911125148 Trial1-2_tracked.json'
 
     tracker = Tracker()
     data    = tracker.process(STABLE_PATH)
