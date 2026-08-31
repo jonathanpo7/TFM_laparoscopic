@@ -1,9 +1,14 @@
+import sys
 import json
 import logging
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from states.state_builder import ARRIVAL_WINDOWS
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +47,13 @@ class Metrics:
 
         logger.info('FPS: %.2f', fps)
 
-        arrival  = self._arrival_at_valid_dest(states)
-        transit  = self._transit_time(states, arrival, fps)
-        economy  = self._movement_economy(states, transit, arrival)
-        bimanual = self._bimanual_coordination(states, transit, arrival)
-        drops    = self._ring_drop_errors(states, transit, arrival)
-        intentos = self._intentos(states, transit, arrival, drops)
+        arrival      = self._arrival_at_valid_dest(states)
+        transit      = self._transit_time(states, arrival, fps)
+        economy      = self._movement_economy(states, transit, arrival)
+        bimanual     = self._bimanual_coordination(states, transit, arrival)
+        drops_fuera  = self._ring_drop_errors(states, transit, arrival)
+        drops_dentro = self._ring_loose_errors(states, transit, arrival)
+        intentos     = self._intentos(drops_fuera, drops_dentro)
 
         rings_completed = sum(1 for v in arrival.values() if v['arrived'])
         rings_total     = len(arrival)
@@ -64,10 +70,11 @@ class Metrics:
         for rid in sorted(arrival, key=int):
             a = arrival[rid]
             t = transit[rid]
-            e = economy.get(rid, {})
-            b = bimanual.get(rid, {})
-            d = drops.get(rid, {})
-            i = intentos.get(rid, {})
+            e  = economy.get(rid, {})
+            b  = bimanual.get(rid, {})
+            df = drops_fuera.get(rid, {})
+            dd = drops_dentro.get(rid, {})
+            i  = intentos.get(rid, {})
             rings_out[rid] = {
                 'home_peg':              states['physical_rings'][rid]['home_peg'],
                 'arrived_at_valid_dest': a['arrived'],
@@ -82,7 +89,8 @@ class Metrics:
                 'accumulated_dist_px':   e.get('accumulated_dist_px'),
                 'economy_ratio':         e.get('economy_ratio'),
                 'bimanual':              b,
-                'drop_errors':           d,
+                'drop_errors':           df,
+                'loose_errors':          dd,
                 'intentos':              i,
             }
 
@@ -350,6 +358,100 @@ class Metrics:
 
         return result
 
+    def _ring_loose_errors(self, states, transit_info, arrival_info, loose_windows=3):
+        """
+        Detecta caídas DENTRO de la plataforma (Métrica 3 del diseño original,
+        ver memoria project_metrics_etapa_c): el ring queda suelto — sin
+        ninguna pinza cerca y sin estar sobre ningún peg — en vez de fuera del
+        área de trabajo (eso lo cubre `_ring_drop_errors`, la otra mitad de la
+        Métrica 3: "salida del campo").
+
+        Condición por ventana:
+          detected      True  — se ve el ring
+          near_peg_id   None  — ni sobre un peg ni claramente cerca de uno
+                                solo. Cubre tanto "lejos de todo" como "justo
+                                en medio de dos pegs": ambos casos ya colapsan
+                                a None en state_builder vía RING_PEG_THRESH
+                                (distancia) y RATIO_THRESH (ambigüedad entre
+                                el peg más cercano y el segundo, ≥0.85 →
+                                ratio_ok=False → near_peg=None).
+          graspers_any  []    — ninguna pinza estuvo cerca en toda la ventana
+          centroide           dentro del bbox de plataforma
+
+        Se confirma con ≥ loose_windows ventanas consecutivas — mismo criterio
+        de racha que `_ring_drop_errors`, para no confundir un instante de
+        detección inestable con una caída real.
+        """
+        platform = states.get('platform')
+        if platform is None:
+            logger.warning('Sin datos de plataforma — omitiendo detección de caídas sueltas')
+            return {rid: {'drops': [], 'n_drops': 0, 'error': 'sin plataforma'}
+                    for rid in states['physical_rings']}
+
+        bbox = platform.get('bbox', [])
+        if len(bbox) != 4:
+            logger.warning('Bbox de plataforma no válido: %s', bbox)
+            return {rid: {'drops': [], 'n_drops': 0, 'error': 'bbox invalido'}
+                    for rid in states['physical_rings']}
+
+        x1, y1, x2, y2 = bbox
+
+        def in_platform(pt):
+            return x1 <= pt[0] <= x2 and y1 <= pt[1] <= y2
+
+        windows = states['windows']
+        ws      = states['window_size']
+        result  = {}
+
+        for rid in states['physical_rings']:
+            t     = transit_info[rid]
+            a     = arrival_info[rid]
+            dep_f = t['departure_frame']
+            arr_w = a['arrival_window']
+            dep_w = dep_f // ws if dep_f is not None else None
+
+            if dep_w is None or arr_w is None:
+                result[rid] = {'drops': [], 'n_drops': 0}
+                continue
+
+            drops     = []
+            loose_run = 0
+            run_start = None
+
+            for wi in range(dep_w, min(arr_w + 1, len(windows))):
+                f = windows[wi]['facts'].get(rid, {})
+                c = f.get('centroid')
+                suelto = (f.get('detected', False)
+                          and f.get('near_peg_id') is None
+                          and not f.get('graspers_any')
+                          and c is not None
+                          and in_platform(c))
+
+                if suelto:
+                    if loose_run == 0:
+                        run_start = wi
+                    loose_run += 1
+                else:
+                    if loose_run >= loose_windows:
+                        drops.append({
+                            'start_window': run_start,
+                            'end_window':   wi - 1,
+                            'n_windows':    loose_run,
+                        })
+                    loose_run = 0
+                    run_start = None
+
+            if loose_run >= loose_windows:
+                drops.append({
+                    'start_window': run_start,
+                    'end_window':   arr_w,
+                    'n_windows':    loose_run,
+                })
+
+            result[rid] = {'drops': drops, 'n_drops': len(drops)}
+
+        return result
+
     def _bimanual_coordination(self, states, transit_info, arrival_info):
         """
         Mide la participación de cada pinza (grasper) por ring durante el tránsito.
@@ -401,58 +503,30 @@ class Metrics:
 
         return result
 
-    def _intentos(self, states, transit_info, arrival_info, drops):
+    def _intentos(self, drops_fuera, drops_dentro):
         """
-        Cuenta intentos fallidos por ring durante el tránsito.
+        Total de errores por ring — los dos tipos de la Métrica 3 original
+        (ver memoria project_metrics_etapa_c), nada más:
 
-        Un intento = contacto con un dest_peg distinto al confirmado que no
-        llegó a acumular las ventanas de confirmación (None→peg_X→None),
-        MÁS caídas fuera de la plataforma.
+          caidas_fuera_campo:   ring salió del polígono de la plataforma
+                                 (`_ring_drop_errors`)
+          caidas_dentro_suelta: ring suelto dentro de la plataforma, sin
+                                 pinza y sin peg (`_ring_loose_errors`)
 
-        Solo se cuentan contactos con pegs distintos al destino final
-        confirmado para no penalizar la aproximación normal al destino correcto.
+        Se descarta el criterio anterior de "contactos_fallidos" (contacto
+        con un peg destino equivocado) — no formaba parte del diseño
+        original y se coló sin corresponder a ninguna de las dos métricas
+        de error definidas.
         """
-        windows   = states['windows']
-        ws        = states['window_size']
-        dest_pegs = set(states['dest_pegs'])
-        phy       = states['physical_rings']
-        ARRIVAL_W = states.get('window_size', 10)  # ventanas de confirmación del estado
-
         result = {}
-        for rid in phy:
-            t        = transit_info[rid]
-            a        = arrival_info[rid]
-            dep_f    = t['departure_frame']
-            arr_w    = a['arrival_window']
-            dest_peg = a['dest_peg']
-            dep_w    = dep_f // ws if dep_f is not None else None
-            n_drops  = drops.get(rid, {}).get('n_drops', 0)
-
-            if dep_w is None or arr_w is None:
-                result[rid] = {'contactos_fallidos': 0, 'caidas': n_drops, 'total': n_drops}
-                continue
-
-            # Buscar ciclos None→peg_X→None excluidos del tramo de confirmación final
-            search_end   = max(dep_w, arr_w - 3)  # ARRIVAL_WINDOWS = 3
-            contactos    = 0
-            in_contact   = False
-
-            for wi in range(dep_w, min(search_end + 1, len(windows))):
-                near = windows[wi]['facts'].get(rid, {}).get('near_peg_id')
-                is_wrong_dest = near in dest_pegs and near != dest_peg
-                if is_wrong_dest:
-                    if not in_contact:
-                        in_contact = True
-                elif in_contact:
-                    contactos += 1
-                    in_contact = False
-
+        for rid in set(drops_fuera) | set(drops_dentro):
+            fuera  = drops_fuera.get(rid, {}).get('n_drops', 0)
+            dentro = drops_dentro.get(rid, {}).get('n_drops', 0)
             result[rid] = {
-                'contactos_fallidos': contactos,
-                'caidas':             n_drops,
-                'total':              contactos + n_drops,
+                'caidas_fuera_campo':   fuera,
+                'caidas_dentro_suelta': dentro,
+                'total':                fuera + dentro,
             }
-
         return result
 
     # ------------------------------------------------------------------
@@ -496,15 +570,21 @@ class Metrics:
                             r['accumulated_dist_px'])
             i = r.get('intentos', {})
             if i.get('total', 0) > 0:
-                logger.info('    intentos: %d total  (contactos=%d  caídas=%d)',
-                            i['total'], i['contactos_fallidos'], i['caidas'])
+                logger.info('    errores: %d total  (fuera del campo=%d  sueltas dentro=%d)',
+                            i['total'], i['caidas_fuera_campo'], i['caidas_dentro_suelta'])
             elif i:
-                logger.info('    intentos: 0')
+                logger.info('    errores: 0')
             d = r.get('drop_errors', {})
             if d.get('n_drops', 0) > 0:
-                logger.info('    caídas detalle: %d episodio(s)', d['n_drops'])
+                logger.info('    caídas fuera del campo: %d episodio(s)', d['n_drops'])
                 for ep in d['drops']:
                     logger.info('      ventanas %d–%d (%d ventanas fuera)',
+                                ep['start_window'], ep['end_window'], ep['n_windows'])
+            dl = r.get('loose_errors', {})
+            if dl.get('n_drops', 0) > 0:
+                logger.info('    caídas sueltas dentro de plataforma: %d episodio(s)', dl['n_drops'])
+                for ep in dl['drops']:
+                    logger.info('      ventanas %d–%d (%d ventanas sueltas)',
                                 ep['start_window'], ep['end_window'], ep['n_windows'])
             b = r.get('bimanual', {})
             if b.get('transit_windows'):

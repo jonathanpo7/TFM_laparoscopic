@@ -40,10 +40,6 @@ def run_pipeline(video_path, output_path, confianza=0.4):
     tracker = Tracker()
     tracked = tracker.process(stable)
 
-    ROOT         = Path(__file__).resolve().parent.parent
-    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / f'{sesion_id}_tracked.json'
-    tracker.save(tracked, TRACKED_PATH)
-
     logger.info('[4/4] States y métricas...')
     builder = StateBuilder()
     states  = builder.build(tracked)

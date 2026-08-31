@@ -15,7 +15,7 @@ COLUMNS = [
     'tiempo_ejercicio_s',
     'transit_time_promedio_s', 'transit_time_min_s', 'transit_time_max_s',
     'economy_ratio_promedio',
-    'caidas_total', 'contactos_fallidos_total', 'intentos_total',
+    'caidas_fuera_campo_total', 'caidas_dentro_suelta_total', 'intentos_total',
     'rings_bimanual', 'rings_perdidos',
 ]
 
@@ -38,9 +38,9 @@ def _row(participante, nombre_video, trial, data):
 
     transit_times  = [r['transit_time_s']  for r in completed if r.get('transit_time_s')  is not None]
     economy_ratios = [r['economy_ratio']    for r in completed if r.get('economy_ratio')   is not None]
-    caidas         = sum(r.get('drop_errors', {}).get('n_drops', 0) for r in rings.values())
-    contactos      = sum(r.get('intentos',   {}).get('contactos_fallidos', 0) for r in rings.values())
-    intentos       = sum(r.get('intentos',   {}).get('total', 0) for r in rings.values())
+    caidas_fuera   = sum(r.get('drop_errors',  {}).get('n_drops', 0) for r in rings.values())
+    caidas_dentro  = sum(r.get('loose_errors', {}).get('n_drops', 0) for r in rings.values())
+    intentos       = sum(r.get('intentos',     {}).get('total', 0)   for r in rings.values())
     bimanual       = sum(1 for r in completed if r.get('bimanual', {}).get('bimanual', False))
     perdidos       = sum(1 for r in rings.values() if r.get('perdido'))
 
@@ -58,9 +58,9 @@ def _row(participante, nombre_video, trial, data):
         'transit_time_min_s':       round(min(transit_times), 3) if transit_times else None,
         'transit_time_max_s':       round(max(transit_times), 3) if transit_times else None,
         'economy_ratio_promedio':   avg(economy_ratios),
-        'caidas_total':             caidas,
-        'contactos_fallidos_total': contactos,
-        'intentos_total':           intentos,
+        'caidas_fuera_campo_total':   caidas_fuera,
+        'caidas_dentro_suelta_total': caidas_dentro,
+        'intentos_total':             intentos,
         'rings_bimanual':           bimanual,
         'rings_perdidos':           perdidos,
     }
