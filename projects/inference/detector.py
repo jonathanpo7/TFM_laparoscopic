@@ -1,9 +1,14 @@
+import sys
 import json
 import logging
 from pathlib import Path
 import torch
 import cv2
 from ultralytics import YOLO
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +41,18 @@ class Detector:
         self.model.model.end2end = False
         self.imgsz = imgsz
 
-    def run(self, video_path, show=False, stabilize_max_frames=30, confianza=0.4, supresion=0.45):
+    def run(self, video_path, show=False, stabilize_max_frames=None, confianza=0.4, supresion=0.45):
         video_path = Path(video_path)
         dispositivo = 0 if torch.cuda.is_available() else 'cpu'
+
+        # El fps se lee ANTES del recorrido: la ventana de grabación de objetos
+        # estáticos está definida en segundos (config.INIT_MAX_SECONDS) y sus
+        # frames dependen del fps real del video.
+        fps = self._read_fps(video_path)
+        if stabilize_max_frames is None:
+            stabilize_max_frames = int(config.INIT_MAX_SECONDS * fps)
+        logger.info('FPS %.2f — grabando estáticos hasta el frame %d (%.1f s)',
+                    fps, stabilize_max_frames, config.INIT_MAX_SECONDS)
 
         frames = []
         results_generator = self.model.predict(
@@ -83,10 +97,6 @@ class Detector:
         if show:
             cv2.destroyAllWindows()
 
-        cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        cap.release()
-
         return {
             'video'                : video_path.name,
             'fps'                  : fps,
@@ -103,11 +113,20 @@ class Detector:
             json.dump(data, f, indent=2)
         logger.info('Inferencia cruda guardada en: %s', output_path)
 
+    def _read_fps(self, video_path):
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if not fps or fps <= 0:
+            logger.warning('No se pudo leer FPS del video, usando 30.0')
+            fps = 30.0
+        return fps
+
 
 def main():
     ROOT        = Path(__file__).resolve().parent.parent
     MODEL_PATH  = ROOT / 'model' / 'xl1280-1.pt'
-    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\Maestria en IA\Trabajo Fin de Master (TFM)\Datasets\Pruebas_personas\P01_FLS Task A_01\20230911125148 Trial1-2.mp4")
+    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\Maestria en IA\Trabajo Fin de Master (TFM)\Datasets\Pruebas_personas\P07_FLS Task A_1\20230925162944 Trial1-2.mp4")
     OUTPUT_PATH = ROOT / 'outputs' / 'raw'
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 

@@ -59,12 +59,22 @@ class Tracker:
 
     def __init__(self, fraction=config.MINI_BBOX_FRACTION):
         self.fraction = fraction
-        self._tracker = ByteTrack(
+        self._tracker = None   # se crea en process(): necesita el fps real del video
+
+    def _make_tracker(self, fps):
+        """ByteTrack con el frame_rate REAL del video.
+
+        ByteTrack escala su buffer interno como track_buffer * frame_rate / 30,
+        así que con frame_rate fijo en 30 un track perdido sobrevivía 2 s en
+        videos de 30 fps pero solo 1 s en los de 60 fps (19 de 26 videos del
+        dataset). Con el fps real, la ventana de supervivencia es ~2 s siempre.
+        """
+        return ByteTrack(
             track_thresh  = config.TRACK_THRESH,
             min_conf      = config.MIN_CONF,
             track_buffer  = config.TRACK_BUFFER,
             match_thresh  = config.MATCH_THRESH,
-            frame_rate    = config.FRAME_RATE,
+            frame_rate    = int(round(fps)),
         )
 
     # ------------------------------------------------------------------
@@ -77,6 +87,13 @@ class Tracker:
         else:
             with open(Path(stable_path_or_data)) as f:
                 stable = json.load(f)
+
+        fps = stable.get('fps') or config.FRAME_RATE
+        if not stable.get('fps'):
+            logger.warning('Stable JSON sin fps — usando respaldo %s', config.FRAME_RATE)
+        self._tracker = self._make_tracker(fps)
+        logger.info('ByteTrack con frame_rate=%d (buffer efectivo ~%.1f s)',
+                    int(round(fps)), config.TRACK_BUFFER * max(int(round(fps)), 1) / 30 / max(fps, 1))
 
         tracked_frames = []
         # track_to_grasper : {track_id -> (grasper_idx, extreme_idx)}
@@ -127,12 +144,22 @@ class Tracker:
                 ring_tracks   = [t for t in tracks if int(t[6]) == ring_class_id]
                 tfm_tracks    = [t for t in tracks if int(t[6]) == tfm_class_id]
 
-                # --- rings: nearest por centroide (sin cambios) ---
+                # --- rings: pool con exclusividad + limite de distancia ---
+                # Misma disciplina que los TFMs: cada track se consume al
+                # asignarse (imposible que dos rings compartan id) y solo se
+                # acepta un track dentro de RING_TRACK_MAX_DIST. Si el track
+                # de un ring murio (oclusion), el ring sale con track_id=-1
+                # ("sin identidad en este frame") en vez de robar el id de un
+                # track lejano sobre otro ring.
+                pool_r = list(ring_tracks)
                 for det in dets_ring:
                     mb   = self._mini_bbox_centroid(det['mask_polygon'], det['bbox'])
                     cx   = (mb[0] + mb[2]) / 2
                     cy   = (mb[1] + mb[3]) / 2
-                    tid  = self._nearest_track_id(cx, cy, ring_tracks)
+                    pool_i, tid = self._nearest_from_pool(
+                        cx, cy, pool_r, max_dist=config.RING_TRACK_MAX_DIST)
+                    if pool_i >= 0:
+                        pool_r.pop(pool_i)
                     entry = {**det, 'track_id': tid}
                     entry['centroid'] = self._compute_centroid(det['mask_polygon'], det['bbox'])
                     tracked_dets.append(entry)
@@ -192,7 +219,10 @@ class Tracker:
 
         return {
             'video'         : stable['video'],
+            'fps'           : stable.get('fps'),
             'imgsz'         : stable['imgsz'],
+            'init_frames'   : stable.get('init_frames'),
+            'init_confiable': stable.get('init_confiable'),
             'static_objects': stable['static_objects'],
             'frames'        : tracked_frames,
         }
@@ -245,10 +275,11 @@ class Tracker:
         # el ID previo; el proximo frame tendra mas informacion.
         return prev_logical
 
-    def _nearest_from_pool(self, cx, cy, pool):
+    def _nearest_from_pool(self, cx, cy, pool, max_dist=None):
         """
         Busca en el pool el track mas cercano a (cx, cy).
-        Devuelve (pool_index, track_id). Devuelve (-1, -1) si el pool esta vacio.
+        Devuelve (pool_index, track_id). Devuelve (-1, -1) si el pool esta vacio
+        o si el mas cercano queda a mas de max_dist px (cuando se especifica).
         El llamador debe hacer pool.pop(pool_index) para consumir el track.
         """
         if not pool:
@@ -264,22 +295,9 @@ class Tracker:
                 best_dist = d
                 best_i    = i
                 best_id   = int(t[4])
+        if max_dist is not None and best_dist > max_dist ** 2:
+            return -1, -1
         return best_i, best_id
-
-    def _nearest_track_id(self, cx, cy, tracks):
-        """Devuelve el track_id mas cercano a (cx, cy). Para rings."""
-        if not tracks:
-            return -1
-        best_id   = -1
-        best_dist = float('inf')
-        for t in tracks:
-            tcx = (t[0] + t[2]) / 2
-            tcy = (t[1] + t[3]) / 2
-            d   = (tcx - cx) ** 2 + (tcy - cy) ** 2
-            if d < best_dist:
-                best_dist = d
-                best_id   = int(t[4])
-        return best_id
 
     def _compute_centroid(self, mask_polygon, bbox):
         if mask_polygon:
@@ -340,8 +358,8 @@ def main():
         handlers=[logging.StreamHandler()],
     )
     ROOT         = Path(__file__).resolve().parent.parent
-    STABLE_PATH  = ROOT / 'outputs' / 'stable'  / '20230911125148 Trial1-2_stable.json'
-    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / '20230911125148 Trial1-2_tracked.json'
+    STABLE_PATH  = ROOT / 'outputs' / 'stable'  / '20230925162944 Trial1-2_stable.json'
+    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / '20230925162944 Trial1-2_tracked.json'
 
     tracker = Tracker()
     data    = tracker.process(STABLE_PATH)

@@ -73,6 +73,7 @@ class Metrics:
                 'arrived_at_valid_dest': a['arrived'],
                 'dest_peg':              a['dest_peg'],
                 'arrival_window':        a['arrival_window'],
+                'perdido':               a['perdido'],
                 'departure_frame':       t['departure_frame'],
                 'arrival_frame':         t['arrival_frame'],
                 'transit_frames':        t['transit_frames'],
@@ -116,8 +117,9 @@ class Metrics:
 
     def _arrival_at_valid_dest(self, states):
         """Determina si cada ring llegó a un peg destino válido."""
-        dest_pegs = set(states['dest_pegs'])
-        result    = {}
+        dest_pegs  = set(states['dest_pegs'])
+        lost_rings = set(str(rid) for rid in states.get('lost_rings', []))
+        result     = {}
 
         for rid in states['physical_rings']:
             arrived_peg    = None
@@ -134,6 +136,7 @@ class Metrics:
                 'arrived':        arrived_peg is not None and arrived_peg in dest_pegs,
                 'dest_peg':       arrived_peg,
                 'arrival_window': arrival_window,
+                'perdido':        rid in lost_rings,
             }
 
         return result
@@ -479,7 +482,7 @@ class Metrics:
                         s['total_exercise_time_s'], s['total_exercise_frames'])
         logger.info('--- por ring ---')
         for rid, r in data['rings'].items():
-            status = 'OK' if r['arrived_at_valid_dest'] else 'NO LLEGÓ'
+            status = 'OK' if r['arrived_at_valid_dest'] else ('PERDIDO' if r['perdido'] else 'NO LLEGÓ')
             if r['transit_time_s'] is not None:
                 logger.info('  Ring %s → peg %s  [%s]  tránsito: %.2f s (%d frames)',
                             rid, r['dest_peg'], status,
@@ -520,10 +523,10 @@ def main():
         handlers=[logging.StreamHandler()],
     )
     ROOT         = Path(__file__).resolve().parent.parent
-    STATES_PATH  = ROOT / 'outputs' / 'states'  / '20230911125148 Trial1-2_states.json'
-    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / '20230911125148 Trial1-2_tracked.json'
-    VIDEO_PATH   = Path(r"C:\Users\Jonathan Piedrahita\Desktop\UAO-Inhealth\Script\videos_pruebas\Video corto.mp4")
-    OUTPUT_PATH  = ROOT / 'outputs' / 'metrics' / '20230911125148 Trial1-2_metrics.json'
+    STATES_PATH  = ROOT / 'outputs' / 'states'  / '20230925162944 Trial1-2_states.json'
+    TRACKED_PATH = ROOT / 'outputs' / 'tracked' / '20230925162944 Trial1-2_tracked.json'
+    VIDEO_PATH   = Path(r"C:\Users\Jonathan Piedrahita\Desktop\Maestria en IA\Trabajo Fin de Master (TFM)\Datasets\Pruebas_personas\P07_FLS Task A_1\20230925162944 Trial1-2.mp4")
+    OUTPUT_PATH  = ROOT / 'outputs' / 'metrics' / '20230925162944 Trial1-2_metrics.json'
 
     m    = Metrics()
     data = m.compute(STATES_PATH, video_path=VIDEO_PATH, tracked_path=TRACKED_PATH)
