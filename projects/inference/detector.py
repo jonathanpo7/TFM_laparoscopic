@@ -126,7 +126,7 @@ class Detector:
 def main():
     ROOT        = Path(__file__).resolve().parent.parent
     MODEL_PATH  = ROOT / 'model' / 'xl1280-1.pt'
-    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\Maestria en IA\Trabajo Fin de Master (TFM)\Datasets\Pruebas_personas\P07_FLS Task A_1\20230925162944 Trial1-2.mp4")
+    VIDEO_PATH  = Path(r"C:\Users\Jonathan Piedrahita\Desktop\UAO-Inhealth\Pruebas\Mov_exitosos\Mov_Exi_1.mp4")
     OUTPUT_PATH = ROOT / 'outputs' / 'raw'
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 

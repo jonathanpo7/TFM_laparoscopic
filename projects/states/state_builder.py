@@ -24,7 +24,13 @@ logger = logging.getLogger(__name__)
 # 60 px es el codo empírico (P01 / P07): cobertura destino 87% / 88% con solo
 # 3.4% / 5.5% de frames ambiguos. A 70 px la cobertura sube 3 puntos pero la
 # ambigüedad salta a 15-19% (empieza a caber más de un peg en el radio).
-RING_PEG_THRESH = 60    # px — ring "cerca de" un peg si dist al anclaje < este valor
+#
+# Ajustado a 65 px (2026-08-31): en Trial1-1, R2 (ring0) se asienta genuinamente
+# a 60.7-61.2 px de su peg destino — 0.7-1.2 px por encima del corte de 60,
+# suficiente para que nunca acumule la racha de confirmación y su tránsito se
+# infle +41s. Verificado que no es ambigüedad con un peg vecino (el más cercano
+# a peg0 está a 134.9 px, muy por debajo del margen de riesgo).
+RING_PEG_THRESH = 65    # px — ring "cerca de" un peg si dist al anclaje < este valor
 # Mismo criterio que RING_PEG_THRESH: la pregunta espacial debe ser LAXA.
 # Con 0.65 se exigía que el peg ganador estuviera 35% más cerca que el segundo,
 # y en la fila de destino —donde la perspectiva junta los pegs— eso rechazaba
@@ -55,6 +61,11 @@ ARRIVAL_WINDOWS   = 6   # ventanas consecutivas para confirmar llegada a base
 LOST_WINDOWS      = 3   # ventanas consecutivas sin detectar al mover activo → sospecha de pérdida
 DEPARTURE_WINDOWS = 3   # ventanas consecutivas lejos de casa para confirmar nuevo mover (filtra ruido de threshold)
 FINAL_VOTE_WINDOWS = 10 # ventanas del cierre para el reparto final por exclusividad (estable entre 8 y 15)
+# Tope de la búsqueda de distancia cruda, en segundos DESDE LA SALIDA real del
+# ring (no desde el inicio del video). El tránsito genuino más largo confirmado
+# contra GT es 38s (con una caída); 55s da margen sin permitir que enganche
+# coincidencias a 60-75s de la salida, como pasó sin acotar (Trial2-3).
+DISTANCE_SEARCH_MAX_S = 55
 
 
 class StateBuilder:
@@ -279,28 +290,110 @@ class StateBuilder:
                 for peg, n in c.items():
                     votos.append((n, rid, peg))
 
+            # Bug corregido: un ring SIN evidencia fresca en el cierre pero con
+            # una confirmación en vivo previa quedaba invisible para este
+            # reparto — otro ring podía ganarle su peg por voto fresco sin que
+            # nadie se enterara, y los dos terminaban con el mismo destino
+            # (confirmado con datos reales: Trial2-1, dos rings → peg 11).
+            #
+            # Se agrega esa confirmación previa como UN VOTO MÁS, con peso
+            # máximo (equivale a dominar toda la ventana final). Así nunca es
+            # invisible — compite en la misma lista, con la misma regla de
+            # exclusividad. Si el ring SÍ tiene evidencia fresca propia
+            # (aunque sea ambigua, apuntando a otro peg), esa evidencia manda
+            # y la confirmación vieja no se protege — necesario para el caso
+            # ya validado en P01 (un ring mal confirmado por un intento
+            # fallido debe poder corregirse).
+            con_evidencia_fresca = {rid for _, rid, _ in votos}
+            for rid in physical_rings:
+                previo = ctx[rid]['arrived_peg']
+                if previo is not None and rid not in con_evidencia_fresca:
+                    votos.append((FINAL_VOTE_WINDOWS, rid, previo))
+
             final_asig, pegs_usados = {}, set()
             for n, rid, peg in sorted(votos, reverse=True):
                 if rid in final_asig or peg in pegs_usados:
                     continue
                 final_asig[rid], _ = peg, pegs_usados.add(peg)
 
-            for rid, peg in final_asig.items():
+            for rid in physical_rings:
+                peg    = final_asig.get(rid)
                 previo = ctx[rid]['arrived_peg']
+
+                # Bug corregido: si un ring quedó marcado `suspected_lost`
+                # (fue mover, se perdió de vista) y MÁS ADELANTE se
+                # reconfirma por la vía normal en el mismo peg que ya vota
+                # el cierre, `previo == peg` entraba directo al `continue` de
+                # abajo y NUNCA limpiaba `suspected_lost` — el ring terminaba
+                # con `arrived_at_valid_dest=True` Y `perdido=True` a la vez
+                # (confirmado con datos reales: Trial2-2, ring0). Cualquier
+                # ring con un peg confirmado, sea nuevo o el mismo de antes,
+                # deja de estar "perdido" — se limpia ANTES del atajo.
+                if peg is not None:
+                    ctx[rid]['suspected_lost'] = False
+
                 if previo == peg:
                     continue
+
+                if peg is None:
+                    # Tenía una confirmación previa pero perdió la competencia
+                    # por ese peg (otro ring tenía mejor evidencia) y no le
+                    # quedó ningún otro — se desconfirma en vez de dejarlo
+                    # duplicado.
+                    #
+                    # Bug corregido: el `break` original solo limpiaba la
+                    # PRIMERA ventana con `arrived_peg` marcado. El carry-forward
+                    # (línea ~200) escribe ese mismo valor en TODAS las ventanas
+                    # posteriores a la confirmación original — con `break`,
+                    # todas esas quedaban con el peg viejo intacto, y el escaneo
+                    # de metrics.py (que busca la primera ventana no-None)
+                    # encontraba la siguiente y reportaba al ring como llegado
+                    # de todos modos (confirmado con datos reales: Trial2-2,
+                    # ring 0 y ring 5 — el log mostraba "pierde su confirmación"
+                    # pero las métricas seguían marcando llegada al peg viejo).
+                    # Hay que limpiar TODAS las ventanas con ese valor, no solo
+                    # la primera.
+                    ctx[rid]['arrived_peg'] = None
+                    for w in windows:
+                        if w['facts'][str(rid)].get('arrived_peg') == previo:
+                            w['facts'][str(rid)]['arrived_peg'] = None
+                    logger.info('Reparto final: ring %d pierde su confirmación en peg %s '
+                                '(otro ring tenía mejor evidencia)', rid, previo)
+                    continue
+
                 ctx[rid]['arrived_peg']    = peg
                 ctx[rid]['suspected_lost'] = False
-                # Reflejarlo en la ventana donde ese ring empezó su racha final
-                for w in windows:
-                    if w['facts'][str(rid)].get('arrived_peg') is not None:
-                        w['facts'][str(rid)]['arrived_peg'] = peg
-                        break
-                else:
-                    for w in ultimas:
-                        if w['facts'][str(rid)]['near_peg_id'] == peg:
+
+                # Intento principal: CUÁNDO llegó de verdad, por distancia
+                # cruda al peg ya confirmado (sin el filtro de ratio). El
+                # filtro de ratio decide A QUÉ peg pertenece, pero puede
+                # ocultar el momento del asentamiento cuando dos pegs quedan
+                # muy cerca — medido en P01: near_peg_id nunca marcó "peg 0"
+                # para un ring sentado ahí 20+ s porque el peg 11 vecino
+                # mantenía el ratio ambiguo, pero la distancia cruda mostraba
+                # el asentamiento clarísimo (racha estable de 42-50 px desde
+                # el segundo exacto del GT). Exige racha COMPLETA (no mayoría
+                # — probado y descartado: la mayoría mejoraba un ring pero
+                # empeoraba otro que ya estaba bien). Si no hay racha limpia
+                # en todo el video, no se toca nada — se cae al respaldo de
+                # siempre.
+                arrival_wi = self._find_arrival_by_distance(windows, pegs, physical_rings, str(rid), peg)
+
+                if arrival_wi is None:
+                    for w in windows:
+                        if w['facts'][str(rid)].get('arrived_peg') is not None:
                             w['facts'][str(rid)]['arrived_peg'] = peg
                             break
+                    else:
+                        for w in ultimas:
+                            if w['facts'][str(rid)]['near_peg_id'] == peg:
+                                w['facts'][str(rid)]['arrived_peg'] = peg
+                                break
+                else:
+                    for w in windows:
+                        w['facts'][str(rid)].pop('arrived_peg', None)
+                    windows[arrival_wi]['facts'][str(rid)]['arrived_peg'] = peg
+
                 logger.info('Reparto final: ring %d → peg %s (antes: %s)', rid, peg, previo)
 
         # Perdido por eliminación: fue mover, se dio por perdido, y nunca
@@ -619,6 +712,50 @@ class StateBuilder:
 
     def _dist(self, a, b):
         return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+    def _find_arrival_by_distance(self, windows, pegs, physical_rings, key, peg,
+                                   thresh=RING_PEG_THRESH, req=ARRIVAL_WINDOWS,
+                                   max_ahead_s=DISTANCE_SEARCH_MAX_S):
+        """Primera racha de `req` ventanas SEGUIDAS con el centroide del ring
+        a menos de `thresh` px del peg — por DISTANCIA CRUDA, no por
+        `near_peg_id` (que ya pasó por el filtro de ratio y puede no marcar
+        nunca ese peg si otro queda cerca). Ver comentario en el reparto
+        final para el caso real que motivó esto.
+
+        ACOTADO (2026-08-31): sin límite, si la racha real es sucia, la
+        búsqueda seguía de largo y enganchaba una racha limpia muy posterior
+        por pura coincidencia — medido en Trial2-3: dos rings distintos
+        "llegaban" casi al mismo segundo (74.7s y 75.7s) sin relación con su
+        salida real (1.3s y 11.3s). Se acota el inicio a la salida real del
+        ring (última ventana detectada en su peg de casa) y el rango a
+        `max_ahead_s` segundos desde ahí — más que el tránsito genuino más
+        largo confirmado contra GT (38s, con una caída). Si no hay racha
+        limpia dentro de ese rango, devuelve None — el llamador cae al
+        respaldo, nunca busca más lejos a ciegas.
+        """
+        home_peg = physical_rings[int(key)]['home_peg']
+        dep_wi = 0
+        for wi, w in enumerate(windows):
+            f = w['facts'][key]
+            if f.get('detected') and f.get('near_peg_id') == home_peg:
+                dep_wi = wi
+
+        max_ahead_w = int(max_ahead_s / WINDOW_SECONDS)
+        end = min(len(windows), dep_wi + max_ahead_w)
+
+        target = pegs[peg]
+        streak = 0
+        for wi in range(dep_wi, end):
+            w = windows[wi]
+            f = w['facts'][key]
+            c = f.get('centroid')
+            if f.get('detected') and c is not None and self._dist(c, target) < thresh:
+                streak += 1
+                if streak >= req:
+                    return wi
+            else:
+                streak = 0
+        return None
 
 
 def main():
