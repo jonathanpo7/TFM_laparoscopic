@@ -4,6 +4,9 @@ import logging
 from collections import defaultdict, Counter
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,30 @@ FINAL_VOTE_WINDOWS = 10 # ventanas del cierre para el reparto final por exclusiv
 # contra GT es 38s (con una caída); 55s da margen sin permitir que enganche
 # coincidencias a 60-75s de la salida, como pasó sin acotar (Trial2-3).
 DISTANCE_SEARCH_MAX_S = 55
+
+# --- Geometría por máscara (2026-09-03, en prueba) ---
+# Reemplaza el criterio de distancia+ratio por dos pruebas geométricas sobre
+# la máscara real del ring, para no depender de un umbral en píxeles que solo
+# vale para la escala/cámara de un dataset (medido: Mov_Exi_1, cámara más
+# cenital que P01/P07, un ring en reposo genuino quedó a 86px del anclaje —
+# por encima de cualquier RING_PEG_THRESH razonable calibrado con el otro
+# dataset).
+#
+# 1. QUIETUD — IoU de la máscara del ring contra su propia máscara de la
+#    ventana anterior. Si no cambia, está quieto. Reemplaza el disparador de
+#    conteo (antes: near_peg_id sostenido N ventanas).
+# 2. PEG CONTENEDOR — una vez quieto, ¿el punto de anclaje (base) de qué peg
+#    cae DENTRO del polígono de la máscara del ring? Prueba binaria (point-
+#    in-polygon), no hay ratio que calibrar. Se usa el anclaje (base), no el
+#    centroide del peg, porque el peg es alargado — un ring posado más
+#    arriba del poste podría "contener" el centroide sin haber bajado hasta
+#    la base real de asiento.
+STILL_IOU_THRESH = 0.5   # IoU mínimo entre máscaras consecutivas para contar como "quieto"
+# 5 en vez de ARRIVAL_WINDOWS(6): P01 Trial1-2 confirma su último movimiento
+# (GT R5, válido a los 127-142s) a centímetros del corte del video —el video
+# fue recortado por el usuario, no es una oclusión real— y con 6 ventanas no
+# alcanza a completar la racha antes de que se acabe la grabación. Probar 5.
+STILL_WINDOWS = 5
 
 
 class StateBuilder:
@@ -156,13 +183,14 @@ class StateBuilder:
                 'prev_graspers':  [],
                 'prev_detected':  True,
                 'last_centroid':  None,
-                'arrival_buf':    {},   # {peg_id: n_ventanas_consecutivas_cerca}
                 'arrived_peg':    None, # primer peg destino confirmado (para no re-loguear)
                 'lost_streak':    0,    # ventanas consecutivas sin detectar mientras era el mover
                 'suspected_lost': False,
                 'away_streak':    0,    # ventanas consecutivas detectado lejos de casa (candidato a mover)
                 'ids':            {r['init_track_id']},  # alias: nombres con los que se le ha visto
                 'unseen':         0,    # ventanas seguidas sin verlo (amplía el radio de continuidad)
+                'still_streak':   0,    # ventanas consecutivas con IoU de máscara ~sin cambio
+                'prev_polygon':   None, # máscara representativa de la ventana anterior
             }
             for rid, r in physical_rings.items()
         }
@@ -195,21 +223,30 @@ class StateBuilder:
                     ctx[rid]['unseen'] += 1
 
                 pid = f['near_peg_id']
+
+                # Quietud: IoU de la máscara de esta ventana contra la de la
+                # ventana anterior. Sin polígono en cualquiera de las dos no
+                # se puede afirmar quietud — se corta la racha (conservador).
+                poly = f.get('mask_polygon')
+                if poly and ctx[rid]['prev_polygon']:
+                    still_iou = self._mask_iou(poly, ctx[rid]['prev_polygon'])
+                    ctx[rid]['still_streak'] = (ctx[rid]['still_streak'] + 1
+                                                 if still_iou >= STILL_IOU_THRESH else 0)
+                else:
+                    ctx[rid]['still_streak'] = 0
+                if poly:
+                    ctx[rid]['prev_polygon'] = poly
+
                 if ctx[rid]['arrived_peg'] is not None:
                     # Ring ya confirmó — solo carry-forward, no toca confirmed_dests
                     f['arrived_peg'] = ctx[rid]['arrived_peg']
-                    ctx[rid]['arrival_buf'] = {}
-                elif pid in dest_pegs and pid not in confirmed_dests:
-                    buf      = ctx[rid]['arrival_buf']
-                    buf[pid] = buf.get(pid, 0) + 1
-                    if buf[pid] >= ARRIVAL_WINDOWS:
-                        f['arrived_peg'] = pid
-                        confirmed_dests.add(pid)
-                        ctx[rid]['arrived_peg'] = pid
-                        logger.info('Ring %d llegó a peg destino %s (ventana %d, frame ~%d)',
-                                    rid, pid, wi, f0)
-                else:
-                    ctx[rid]['arrival_buf'] = {}
+                elif (pid in dest_pegs and pid not in confirmed_dests
+                      and ctx[rid]['still_streak'] >= STILL_WINDOWS):
+                    f['arrived_peg'] = pid
+                    confirmed_dests.add(pid)
+                    ctx[rid]['arrived_peg'] = pid
+                    logger.info('Ring %d llegó a peg destino %s (ventana %d, frame ~%d)',
+                                rid, pid, wi, f0)
 
                 # Racha de "detectado lejos de casa" — señal de posible
                 # desplazamiento real. Requiere sostenerse DEPARTURE_WINDOWS
@@ -643,16 +680,16 @@ class StateBuilder:
                         per_frame[rid].append(None)
                     continue
 
-                cx, cy             = det['centroid']
-                pid, dst, second_d = self._nearest_peg(cx, cy, pegs)
-                ratio_ok           = dst / second_d < RATIO_THRESH if second_d > 0 else True
-                near_peg           = pid if dst < RING_PEG_THRESH and ratio_ok else None
+                cx, cy  = det['centroid']
+                polygon = det.get('mask_polygon')
+                near_peg = self._contained_peg(det.get('bbox'), pegs, (cx, cy))
                 graspers = self._graspers_near(cx, cy, tfm_dets)
 
                 # near_peg refleja posición real del ring.
                 # Si hay grasper pero el ring sigue sobre un peg, near_peg se conserva.
 
-                per_frame[rid].append({'near_peg': near_peg, 'graspers': graspers, 'centroid': [cx, cy]})
+                per_frame[rid].append({'near_peg': near_peg, 'graspers': graspers,
+                                        'centroid': [cx, cy], 'polygon': polygon})
 
         return {rid: self._aggregate(per_frame[rid], ctx[rid])
                 for rid in physical_rings}
@@ -669,6 +706,7 @@ class StateBuilder:
                 'graspers_near': ctx['prev_graspers'],
                 'graspers_any':  [],
                 'centroid':      None,
+                'mask_polygon':  None,
             }
 
         # Moda del peg (incluye None si es el valor más frecuente)
@@ -684,12 +722,20 @@ class StateBuilder:
         cs = [s['centroid'] for s in detected if s.get('centroid') is not None]
         avg_centroid = [round(sum(x) / len(cs), 1) for x in zip(*cs)] if cs else None
 
+        # Máscara representativa de la ventana: la del último frame detectado
+        # con polígono — se usa para el IoU de quietud contra la ventana
+        # siguiente (comparar bordes de ventana, no un promedio sin sentido
+        # geométrico entre polígonos de distintos frames).
+        polys = [s['polygon'] for s in detected if s.get('polygon')]
+        rep_polygon = polys[-1] if polys else None
+
         return {
             'detected':      rate >= 0.5,
             'near_peg_id':   peg_mode,
             'graspers_near': graspers_near,
             'graspers_any':  graspers_any,
             'centroid':      avg_centroid,
+            'mask_polygon':  rep_polygon,
         }
 
     def _graspers_near(self, cx, cy, tfm_dets):
@@ -712,6 +758,83 @@ class StateBuilder:
 
     def _dist(self, a, b):
         return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+    def _contained_peg(self, bbox, pegs, centroid):
+        """¿El anclaje (base) de qué peg cae DENTRO del bbox real del ring?
+
+        2026-09-03: probado primero con el polígono de la máscara — regresión
+        grave en los 4 videos ya validados (Trial1-1 6/6→5/6 con un ring de
+        25s inflado a 106s, P01 y P07 6/6→3/6, decenas de "caídas sueltas"
+        espurias). El borde de la máscara del aro no siempre llega hasta el
+        pixel exacto del anclaje aunque esté bien puesto (imprecisión de
+        segmentación). El propio ByteTrack que usamos viene de
+        `boxmot.trackers.bbox.bytetrack` — ni el tracker confía en la forma
+        exacta de la máscara, usa un mini-bbox. Se prueba bbox del ring
+        (`det['bbox']`, no el mini-bbox de tracking) — más permisivo que el
+        polígono exacto, sigue sin ser un número de píxeles que calibrar.
+
+        Si varios anclajes caen dentro a la vez (pegs muy juntos), gana el
+        más cercano al centroide del ring. Sin bbox, cae al respaldo de
+        siempre (distancia + ratio) para no perder el frame.
+        """
+        if not bbox:
+            pid, dst, second_d = self._nearest_peg(*centroid, pegs)
+            ratio_ok = dst / second_d < RATIO_THRESH if second_d > 0 else True
+            return pid if dst < RING_PEG_THRESH and ratio_ok else None
+
+        x0, y0, x1, y1 = bbox
+        contenidos = [pid for pid, (ax, ay) in pegs.items()
+                      if x0 <= ax <= x1 and y0 <= ay <= y1]
+        if not contenidos:
+            return None
+        if len(contenidos) == 1:
+            return contenidos[0]
+        return min(contenidos, key=lambda pid: self._dist(pegs[pid], centroid))
+
+    def _point_in_polygon(self, point, polygon):
+        """Ray casting estándar. `polygon`: lista de [x, y]."""
+        x, y = point
+        inside = False
+        n = len(polygon)
+        x0, y0 = polygon[-1]
+        for i in range(n):
+            x1, y1 = polygon[i]
+            if (y1 > y) != (y0 > y):
+                x_cross = (x0 - x1) * (y - y1) / (y0 - y1 + 1e-12) + x1
+                if x < x_cross:
+                    inside = not inside
+            x0, y0 = x1, y1
+        return inside
+
+    def _mask_iou(self, poly_a, poly_b):
+        """IoU entre dos polígonos por rasterización (sin depender de shapely).
+
+        Ambos se dibujan sobre un lienzo local del tamaño de su caja
+        envolvente conjunta — evita rasterizar el frame completo por cada
+        par de ventanas.
+        """
+        pts_a = np.asarray(poly_a, dtype=np.float32)
+        pts_b = np.asarray(poly_b, dtype=np.float32)
+        if len(pts_a) < 3 or len(pts_b) < 3:
+            return 0.0
+
+        todos   = np.vstack([pts_a, pts_b])
+        x_min, y_min = todos.min(axis=0)
+        x_max, y_max = todos.max(axis=0)
+        w = int(np.ceil(x_max - x_min)) + 2
+        h = int(np.ceil(y_max - y_min)) + 2
+        if w <= 0 or h <= 0 or w > 4000 or h > 4000:
+            return 0.0
+
+        offset = np.array([x_min, y_min])
+        mask_a = np.zeros((h, w), dtype=np.uint8)
+        mask_b = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask_a, [np.round(pts_a - offset).astype(np.int32)], 1)
+        cv2.fillPoly(mask_b, [np.round(pts_b - offset).astype(np.int32)], 1)
+
+        inter = int(np.logical_and(mask_a, mask_b).sum())
+        union = int(np.logical_or(mask_a, mask_b).sum())
+        return inter / union if union > 0 else 0.0
 
     def _find_arrival_by_distance(self, windows, pegs, physical_rings, key, peg,
                                    thresh=RING_PEG_THRESH, req=ARRIVAL_WINDOWS,
