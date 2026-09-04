@@ -5,7 +5,7 @@
 # `pip install -r requirements.txt` ya instala la build CPU desde PyPI.
 torch==2.5.1
 ultralytics==8.4.78
-boxmot==19.0.0
+boxmot==22.0.0
 opencv-python==4.13.0
 numpy>=1.24,<2.3
 scikit-learn==1.7.2

@@ -6,8 +6,15 @@ import csv
 import json
 from pathlib import Path
 
-METRICS_DIR = Path(__file__).resolve().parent.parent / 'outputs' / 'metrics'
-OUTPUT_CSV  = Path(__file__).resolve().parent.parent / 'outputs' / 'consolidado.csv'
+METRICS_DIR   = Path(__file__).resolve().parent.parent / 'outputs' / 'metrics'
+OUTPUT_CSV    = Path(__file__).resolve().parent.parent / 'outputs' / 'consolidado.csv'
+IGNORAR_DIRS  = {'metrics_viejas'}
+
+PARTICIPANTE_POR_FECHA = {
+    '20230911': 'P01',
+    '20230925': 'P07',
+    '20231109': 'P10',
+}
 
 COLUMNS = [
     'participante', 'nombre_video', 'trial',
@@ -20,8 +27,11 @@ COLUMNS = [
 ]
 
 
-def _participante(folder_name):
-    return folder_name.split('_')[0]
+def _participante(jf):
+    if jf.parent != METRICS_DIR:
+        return jf.parent.name.split('_')[0]
+    fecha = jf.stem.split(' ')[0]
+    return PARTICIPANTE_POR_FECHA.get(fecha)
 
 
 def _trial(stem):
@@ -69,16 +79,21 @@ def _row(participante, nombre_video, trial, data):
 def main():
     rows = []
 
-    for folder in sorted(METRICS_DIR.iterdir()):
-        if not folder.is_dir():
+    for jf in sorted(METRICS_DIR.rglob('*_metrics.json')):
+        if IGNORAR_DIRS & set(jf.relative_to(METRICS_DIR).parts[:-1]):
             continue
-        participante = _participante(folder.name)
-        for jf in sorted(folder.glob('*_metrics.json')):
-            with open(jf) as f:
-                data = json.load(f)
-            nombre_video = jf.stem.replace('_metrics', '')
-            trial        = _trial(jf.stem)
-            rows.append(_row(participante, nombre_video, trial, data))
+        stem = jf.stem
+        participante = _participante(jf)
+        if participante is None:
+            print(f'  (omitido, sin participante reconocido: {jf})')
+            continue
+        with open(jf) as f:
+            data = json.load(f)
+        nombre_video = stem.replace('_metrics', '')
+        trial        = _trial(stem)
+        rows.append(_row(participante, nombre_video, trial, data))
+
+    rows.sort(key=lambda r: (r['participante'], r['trial']))
 
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
